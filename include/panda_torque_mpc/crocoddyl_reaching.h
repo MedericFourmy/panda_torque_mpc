@@ -11,6 +11,12 @@
 #include <crocoddyl/core/action-base.hpp>
 #include <crocoddyl/core/solvers/fddp.hpp>
 
+#include <colmpc/fwd.hpp>
+#include <colmpc/residual-distance-collision.hpp>
+
+#include <mim_solvers/csqp.hpp>
+#include <mim_solvers/sqp.hpp>
+
 #include "panda_torque_mpc/common.h"
 
 namespace pin = pinocchio;
@@ -21,7 +27,11 @@ namespace panda_torque_mpc
     {
         size_t T; // nb of nodes - terminal one
         double dt_ocp;
+        double solver_termination_tolerance;
+        double qp_termination_tol_abs;
+        double qp_termination_tol_rel;
         size_t nb_iterations_max;
+        size_t max_qp_iter;
 
         std::string ee_frame_name;
         bool reference_is_placement = false;
@@ -54,7 +64,8 @@ namespace panda_torque_mpc
             // dummy constructor necessary to use this class as a member variable directly
         }
 
-        CrocoddylReaching(pin::Model _model_pin, CrocoddylConfig _config);
+        CrocoddylReaching(pin::Model _model_pin, const boost::shared_ptr<pin::GeometryModel>& _collision_model ,CrocoddylConfig _config);
+        // CrocoddylReaching(pin::Model _model_pin, CrocoddylConfig _config);
 
         void set_ee_ref_translation(Eigen::Vector3d trans, bool is_active=true);
         /**
@@ -66,7 +77,9 @@ namespace panda_torque_mpc
 
         void set_posture_ref(Eigen::VectorXd x0);
 
-        boost::shared_ptr<crocoddyl::SolverFDDP> ocp_;
+        // boost::shared_ptr<crocoddyl::SolverFDDP> ocp_;
+        // boost::shared_ptr<mim_solvers::SolverSQP> ocp_;
+        boost::shared_ptr<mim_solvers::SolverCSQP> ocp_;
         CrocoddylConfig config_;
 
         std::string cost_translation_name_;
@@ -74,6 +87,7 @@ namespace panda_torque_mpc
         std::string cost_velocity_name_;
         std::string cost_state_reg_name_;
         std::string cost_ctrl_reg_name_;
+        
         
         // safe guards
         bool goal_translation_set_;

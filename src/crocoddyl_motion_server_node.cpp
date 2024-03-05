@@ -1,10 +1,21 @@
+#include <boost/smart_ptr/shared_ptr.hpp>
 #include <string>
+#include <cassert>
+ 
+// Use (void) to silence unused warnings.
+#define assertm(exp, msg) assert(((void)msg, exp))
 
 #include <pinocchio/fwd.hpp>
 #include <pinocchio/multibody/data.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/multibody/geometry.hpp>
+#include <pinocchio/multibody/fcl.hpp>
+
+#include <hpp/fcl/collision_object.h>
+#include <hpp/fcl/shape/geometric_shapes.h>
+
 
 #include <linear_feedback_controller_msgs/Sensor.h>
 #include <linear_feedback_controller_msgs/Control.h>
@@ -13,6 +24,7 @@
 
 #include <realtime_tools/realtime_box.h>
 #include <ros/ros.h>
+#include <ros/package.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -20,6 +32,7 @@
 #include "panda_torque_mpc/crocoddyl_reaching.h"
 
 #include "geometry_msgs/PoseStamped.h"
+#include "std_msgs/Duration.h"
 
 
 
@@ -40,7 +53,8 @@ namespace panda_torque_mpc
                           std::string cam_pose_viz_topic_pub,
                           std::string cam_pose_ref_viz_topic_pub,
                           std::string cam_pose_error_topic_pub,
-                          std::string ee_pose_error_topic_pub
+                          std::string ee_pose_error_topic_pub,
+                          std::string ocp_solve_time_topic_pub
                           )
         {
             bool params_success = true;
@@ -51,15 +65,19 @@ namespace panda_torque_mpc
             params_success = get_param_error_tpl<std::string>(nh, arm_id, "arm_id") && params_success;
 
             // Croco params
-            int nb_shooting_nodes, nb_iterations_max;
-            double dt_ocp, w_frame_running, w_frame_terminal, w_frame_vel_running, w_frame_vel_terminal, w_x_reg_running, w_x_reg_terminal, w_u_reg_running;
+            int nb_shooting_nodes, nb_iterations_max, max_qp_iter;
+            double dt_ocp,solver_termination_tolerance,qp_termination_tol_abs , qp_termination_tol_rel, w_frame_running, w_frame_terminal, w_frame_vel_running, w_frame_vel_terminal, w_x_reg_running, w_x_reg_terminal, w_u_reg_running;
             std::vector<double> diag_frame_vel, diag_q_reg_running, diag_v_reg_running, diag_u_reg_running, armature;
             std::vector<double> pose_e_c, pose_c_o_ref;  // px,py,pz, qx,qy,qz,qw
             bool reference_is_placement;
 
             params_success = get_param_error_tpl<int>(nh, nb_shooting_nodes, "nb_shooting_nodes") && params_success;
             params_success = get_param_error_tpl<double>(nh, dt_ocp, "dt_ocp") && params_success;
+            params_success = get_param_error_tpl<double>(nh, solver_termination_tolerance, "solver_termination_tolerance") && params_success;
+            params_success = get_param_error_tpl<double>(nh, qp_termination_tol_abs, "qp_termination_tol_abs") && params_success;
+            params_success = get_param_error_tpl<double>(nh, qp_termination_tol_rel, "qp_termination_tol_rel") && params_success;
             params_success = get_param_error_tpl<int>(nh, nb_iterations_max, "nb_iterations_max") && params_success;
+            params_success = get_param_error_tpl<int>(nh, max_qp_iter, "max_qp_iter") && params_success;
             params_success = get_param_error_tpl<bool>(nh, reference_is_placement, "reference_is_placement") && params_success;
             params_success = get_param_error_tpl<bool>(nh, keep_original_ee_rotation_, "keep_original_ee_rotation") && params_success;
             params_success = get_param_error_tpl<double>(nh, w_frame_running,  "w_frame_running") && params_success;
@@ -95,30 +113,71 @@ namespace panda_torque_mpc
             params_success = get_param_error_tpl<std::string>(nh, ee_frame_name_, "ee_frame_name") && params_success;
 
             
-
             if (!params_success)
             {
                 throw std::invalid_argument("CrocoMotionServer: check the your ROS parameters");
             }
-            
+
             model_pin_ = loadPandaPinocchio();
             data_pin_ = pin::Data(model_pin_);
 
+            // Creating the collision model
+            std::string urdf_path = ros::package::getPath("panda_torque_mpc") + "/urdf/robot.urdf";
+
+            // Building the GeometryModel
+            auto collision_model = boost::make_shared<pinocchio::GeometryModel>();
+            collision_model = loadPandaGeometryModel(model_pin_);
+
+            double radius = 0.35/2.0;
+
+            auto geometry = pinocchio::GeometryObject::CollisionGeometryPtr(new hpp::fcl::Sphere(radius));
+
+            pinocchio::SE3 obstacle_pose(Eigen::Quaterniond (1.,0.,0.,0.), Eigen::Vector3d (0,0,0.825));
+            // pinocchio::SE3 obstacle_pose;
+            // obstacle_pose.setIdentity();
+            // obstacle_pose.trans << 0., 0., 0.;
+
+            pinocchio::GeometryObject obstacle("obstacle", 0,0, geometry, obstacle_pose);
+            collision_model->addGeometryObject(obstacle);
+
+
+            assertm(collision_model->getGeometryId("obstacle") < collision_model->geometryObjects.size(), "The index of the obstacle is not right.");
+            assertm(collision_model->getGeometryId("panda_leftfinger_0") < collision_model->geometryObjects.size(), "The index of the panda_leftfinger_0 is not right.");
+            assertm(collision_model->getGeometryId("panda_rightfinger_0") < collision_model->geometryObjects.size(), "The index of the panda_rightfinger_0 is not right.");
+
+            //   Print out the placement of each collision geometry object
+
+            collision_model->addCollisionPair(pinocchio::CollisionPair(collision_model->getGeometryId("obstacle"),
+                collision_model->getGeometryId("panda_leftfinger_0")));
+
+            collision_model->addCollisionPair(pinocchio::CollisionPair(collision_model->getGeometryId("obstacle"),
+                collision_model->getGeometryId("panda_rightfinger_0")));
+
+            collision_model->addCollisionPair(pinocchio::CollisionPair(collision_model->getGeometryId("obstacle"),
+                collision_model->getGeometryId("panda_link7_sc_1")));
+
+            collision_model->addCollisionPair(pinocchio::CollisionPair(collision_model->getGeometryId("obstacle"),
+                collision_model->getGeometryId("panda_link7_sc_4")));
+                        
             if ((model_pin_.nq != 7) || (model_pin_.name != "panda"))
             {
                 ROS_ERROR_STREAM("Problem when loading the robot urdf");
                 throw std::invalid_argument("CrocoMotionServer: Problem with the loaded robot model");
-            }
+            } 
 
             // Define corresponding frame id for pinocchio and Franka (see ctrl_model_pinocchio_vs_franka)
             ee_frame_id_ = model_pin_.getFrameId(ee_frame_name_);
-
+            
             /////////////////////////////////////////////////
             //                MPC CONFIG                   //
             /////////////////////////////////////////////////
             config_croco_.T = nb_shooting_nodes;
             config_croco_.dt_ocp = dt_ocp;
+            config_croco_.solver_termination_tolerance= solver_termination_tolerance;
+            config_croco_.qp_termination_tol_abs= qp_termination_tol_abs;
+            config_croco_.qp_termination_tol_rel= qp_termination_tol_rel;
             config_croco_.nb_iterations_max = nb_iterations_max;
+            config_croco_.max_qp_iter = max_qp_iter;
             config_croco_.ee_frame_name = ee_frame_name_;
             config_croco_.reference_is_placement = reference_is_placement;
             config_croco_.w_frame_running =  w_frame_running;
@@ -134,7 +193,8 @@ namespace panda_torque_mpc
             config_croco_.diag_u_reg_running = Eigen::Map<Eigen::Matrix<double, 7, 1>>(diag_u_reg_running.data());
             config_croco_.armature = Eigen::Map<Eigen::Matrix<double, 7, 1>>(armature.data());
 
-            croco_reaching_ = CrocoddylReaching(model_pin_, config_croco_);
+            // croco_reaching_ = CrocoddylReaching(model_pin_ ,config_croco_);
+            croco_reaching_ = CrocoddylReaching(model_pin_, collision_model ,config_croco_);
             /////////////////////////////////////////////////
 
             // Publishers
@@ -143,6 +203,7 @@ namespace panda_torque_mpc
             cam_pose_ref_pub_ = nh.advertise<geometry_msgs::PoseStamped>(cam_pose_ref_viz_topic_pub, 1);
             cam_pose_error_pub_ = nh.advertise<geometry_msgs::PoseStamped>(cam_pose_error_topic_pub, 1);
             ee_pose_error_pub_ = nh.advertise<geometry_msgs::PoseStamped>(ee_pose_error_topic_pub, 1);
+            ocp_solve_time_pub_ = nh.advertise<std_msgs::Duration>(ocp_solve_time_topic_pub, 1);
             
             // Subscribers
             sensor_sub_ = nh.subscribe(robot_sensors_topic_sub, 10, &CrocoMotionServer::callback_robot_state, this);
@@ -168,7 +229,7 @@ namespace panda_torque_mpc
              * Callback using the pose as a reference in robot base frame 
              */
             pin::SE3 T_b_e_ref = posemsg2SE3(msg.pose);
-            T_b_e_ref_rtbox_.set(T_b_e_ref);
+            T_b_e_ref_rtbox_ = T_b_e_ref;
             if (!first_pose_ref_msg_received_)
             {
                 first_pose_ref_msg_received_ = true;
@@ -177,7 +238,7 @@ namespace panda_torque_mpc
 
             // ------- LOGS ----------- //
             // Reference tracking error
-            pin::SE3 T_b_e; T_b_e_rtbox_.get(T_b_e);
+            pin::SE3 T_b_e; T_b_e = T_b_e_rtbox_;
             pin::SE3 T_b_e_error = T_b_e_ref.inverse() * T_b_e;
             publish_SE3_posestamped(ee_pose_error_pub_, T_b_e_error, msg.header);
         }
@@ -212,7 +273,7 @@ namespace panda_torque_mpc
             // Set reference pose
             // compose initial pose with relative/local transform
             pin::SE3 T_b_e_ref = T_b_e0_ * T_e0_e;
-            T_b_e_ref_rtbox_.set(T_b_e_ref);
+            T_b_e_ref_rtbox_ = T_b_e_ref;
 
             if (!first_pose_ref_msg_received_)
             {
@@ -222,7 +283,7 @@ namespace panda_torque_mpc
 
             // ------- LOGS ----------- //
             // Reference tracking error
-            pin::SE3 T_b_e; T_b_e_rtbox_.get(T_b_e);
+            pin::SE3 T_b_e; T_b_e = T_b_e_rtbox_;
             pin::SE3 T_b_e_error = T_b_e_ref.inverse() * T_b_e;
             publish_SE3_posestamped(ee_pose_error_pub_, T_b_e_error, msg.header);
         }
@@ -241,13 +302,13 @@ namespace panda_torque_mpc
             pin::SE3 T_c_o_meas = posemsg2SE3(msg_pose_c_o.pose);
             pin::SE3 T_o_c_meas = T_c_o_meas.inverse();
 
-            pin::SE3 T_b_e; T_b_e_rtbox_.get(T_b_e);
+            pin::SE3 T_b_e; T_b_e = T_b_e_rtbox_;
 
             pin::SE3 T_b_c_ref = T_b_e * T_e_c_ * T_c_o_meas * T_o_c_ref_;
             pin::SE3 T_b_e_ref = T_b_c_ref * T_c_e_;
 
             // RT safe setting
-            T_b_e_ref_rtbox_.set(T_b_e_ref);
+            T_b_e_ref_rtbox_ = T_b_e_ref;
 
             if (!first_pose_ref_msg_received_)
             {
@@ -280,7 +341,7 @@ namespace panda_torque_mpc
              * 
             */
 
-            pin::SE3 T_b_e; T_b_e_rtbox_.get(T_b_e);
+            pin::SE3 T_b_e; T_b_e = T_b_e_rtbox_;
 
             if (!first_pose_ref_msg_received_)
             {
@@ -297,7 +358,7 @@ namespace panda_torque_mpc
             pin::SE3 T_b_e_ref = T_b_c_ref * T_c_e_;
             
             // RT safe setting
-            T_b_e_ref_rtbox_.set(T_b_e_ref);
+            T_b_e_ref_rtbox_ = T_b_e_ref;
 
             if (!first_pose_ref_msg_received_)
             {
@@ -326,19 +387,19 @@ namespace panda_torque_mpc
             lfc_msgs::sensorMsgToEigen(sensor_msg, sensor_eig);
             Eigen::Matrix<double, 14, 1> current_x;
             current_x << sensor_eig.joint_state.position, sensor_eig.joint_state.velocity;
-            current_x_rtbox_.set(current_x);
+            current_x_rtbox_ = current_x;
 
             pin::forwardKinematics(model_pin_, data_pin_, sensor_eig.joint_state.position);
             pin::updateFramePlacements(model_pin_, data_pin_);
 
             pin::SE3 T_b_e = data_pin_.oMf[ee_frame_id_];
-            T_b_e_rtbox_.set(T_b_e);
+            T_b_e_rtbox_ = T_b_e;
 
             if (!first_robot_sensor_msg_received_)
             {
                 T_b_e0_ = T_b_e;
 
-                q_init_rtbox_.set(sensor_eig.joint_state.position);
+                q_init_rtbox_ = sensor_eig.joint_state.position;
                 first_robot_sensor_msg_received_ = true;
             }
         }
@@ -352,15 +413,15 @@ namespace panda_torque_mpc
             }
 
             // Retrieve end effector reference/current in thread-safe way
-            pin::SE3 T_b_e_ref; T_b_e_ref_rtbox_.get(T_b_e_ref);
-            pin::SE3 T_b_e; T_b_e_rtbox_.get(T_b_e);
+            pin::SE3 T_b_e_ref; T_b_e_ref = T_b_e_ref_rtbox_;
+            pin::SE3 T_b_e; T_b_e = T_b_e_rtbox_;
 
             // Retrieve initial configuration in thread-safe way
-            Vector7d q_init; q_init_rtbox_.get(q_init);
+            Vector7d q_init; q_init = q_init_rtbox_;
             Eigen::Matrix<double,14,1> x_init; x_init << q_init, Vector7d::Zero();  // Fix zero velocity as reference
 
             // Retrieve current state in a thread-safe way
-            Eigen::Matrix<double, 14, 1> current_x; current_x_rtbox_.get(current_x);
+            Eigen::Matrix<double, 14, 1> current_x; current_x = current_x_rtbox_;
             Vector7d q = current_x.head(model_pin_.nq);
             Vector7d v = current_x.tail(model_pin_.nv);
 
@@ -420,7 +481,11 @@ namespace panda_torque_mpc
 
             TicTac tt_solve;
             bool ok = croco_reaching_.solve(xs_init, us_init);
-            std::cout << std::setprecision(9) << "n_iter, dt_solve (ms): " << croco_reaching_.ocp_->get_iter() << ", " << tt_solve.tac() << std::endl;
+            const auto duration = tt_solve.tac();
+            std::cout << std::setprecision(9) << "n_iter, dt_solve (ms): " << croco_reaching_.ocp_->get_iter() << ", " << duration << std::endl;
+            std_msgs::Duration time;
+            time.data = ros::Duration(duration * 0.001);
+            ocp_solve_time_pub_.publish(time);
             // if problem not ready or no good solution, don't send a solution
             if (!ok) return;
             //////////////////////////////////////
@@ -438,10 +503,10 @@ namespace panda_torque_mpc
 
         // sensor callback
         ros::Time t_sensor_;
-        realtime_tools::RealtimeBox<Vector7d> q_init_rtbox_;
-        realtime_tools::RealtimeBox<Eigen::Matrix<double, 14, 1>> current_x_rtbox_;
+        Vector7d q_init_rtbox_;
+        Eigen::Matrix<double, 14, 1> current_x_rtbox_;
         pin::SE3 T_b_e0_;
-        realtime_tools::RealtimeBox<pin::SE3> T_b_e_rtbox_;
+        pin::SE3 T_b_e_rtbox_;
 
         // Visual servoing
         // Camera calibration
@@ -454,7 +519,7 @@ namespace panda_torque_mpc
 
         // pose ref callback
         pin::SE3 T_w_t0_;
-        realtime_tools::RealtimeBox<pin::SE3> T_b_e_ref_rtbox_;
+        pin::SE3 T_b_e_ref_rtbox_;
 
         // Solve state machine
         bool first_solve_;
@@ -481,6 +546,7 @@ namespace panda_torque_mpc
         ros::Publisher cam_pose_ref_pub_;
         ros::Publisher cam_pose_error_pub_;
         ros::Publisher ee_pose_error_pub_;
+        ros::Publisher ocp_solve_time_pub_;
 
         // Subscriber to robot sensor from linearized ctrl
         ros::Subscriber sensor_sub_;
@@ -505,10 +571,12 @@ int main(int argc, char **argv)
 {
 
     ros::init(argc, argv, "crocoddyl_motion_server_node");
+
     ros::NodeHandle nh;
+
     std::string robot_sensors_topic_sub = "robot_sensors";
     std::string control_topic_pub = "motion_server_control";
-    
+
     std::string absolute_pose_ref_topic_sub = "absolute_pose_ref";  // ABSOLUTE REFERENCE DEMO
     std::string motion_capture_pose_ref_topic_sub = "motion_capture_pose_ref";  // MOCAP DEMO
     std::string pose_camera_object_topic_sub = "pose_camera_object";  // VISUAL SERVOING DEMO 
@@ -517,6 +585,8 @@ int main(int argc, char **argv)
     std::string cam_pose_ref_viz_topic_pub = "cam_pose_ref_viz";
     std::string cam_pose_error_topic_pub = "cam_pose_error";
     std::string ee_pose_error_topic_pub = "ee_pose_error";
+    std::string ocp_solve_time_topic_pub = "ocp_solve_time";
+
     auto motion_server = panda_torque_mpc::CrocoMotionServer(
                             nh, 
                             robot_sensors_topic_sub,
@@ -528,8 +598,10 @@ int main(int argc, char **argv)
                             cam_pose_viz_topic_pub,
                             cam_pose_ref_viz_topic_pub,
                             cam_pose_error_topic_pub,
-                            ee_pose_error_topic_pub
+                            ee_pose_error_topic_pub,
+                            ocp_solve_time_topic_pub
                             );
+
     int freq_solve;
     int success_read = panda_torque_mpc::get_param_error_tpl<int>(nh, freq_solve, "freq_solve");
     if (!success_read){

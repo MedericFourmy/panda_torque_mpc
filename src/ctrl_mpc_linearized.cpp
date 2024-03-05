@@ -54,6 +54,11 @@ namespace panda_torque_mpc
 
         model_pin_ = loadPandaPinocchio();
         data_pin_ = pin::Data(model_pin_);
+
+        std::cout << " ee_frame_name_ : " << ee_frame_name_ << std::endl;
+        std::cout << " model_pin_.getFrameId(ee_frame_name_) : " << model_pin_.getFrameId(ee_frame_name_) << std::endl;
+        std::cout <<  " model_pin_.getFrameId(do not exist) : " << model_pin_.getFrameId("do not exist") << std::endl;
+
         if ((model_pin_.nq != 7) || (model_pin_.name != "panda"))
         {
             ROS_ERROR_STREAM("Problem when loading the robot urdf");
@@ -62,6 +67,7 @@ namespace panda_torque_mpc
 
         // Define corresponding frame id for pinocchio and Franka (see ctrl_model_pinocchio_vs_franka)
         ee_frame_id_ = model_pin_.getFrameId(ee_frame_name_);
+        
 
         ///////////////////
         // Claim interfaces
@@ -131,9 +137,6 @@ namespace panda_torque_mpc
         std::string motion_server_sub_topic = "motion_server_control";
         motion_server_control_topic_sub_ = nh.subscribe(motion_server_sub_topic, 10, &CtrlMpcLinearized::callback_motion_server, this);
 
-        // Controller state machine
-        bool control_ref_from_ddp_node_received_ = false;
-
         return true;
     }
 
@@ -142,6 +145,9 @@ namespace panda_torque_mpc
         ROS_INFO_STREAM("CtrlMpcLinearized::starting");
         t_init_ = t0;
         q_init_ = Eigen::Map<const Vector7d>(franka_state_handle_->getRobotState().q.data());
+        
+        // Controller state machine
+        control_ref_from_ddp_node_received_ = false;
     }
 
     void CtrlMpcLinearized::update(const ros::Time &t, const ros::Duration &period)

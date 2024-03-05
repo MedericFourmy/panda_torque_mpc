@@ -10,9 +10,12 @@
 #include <pinocchio/parsers/urdf.hpp>
 
 #include <crocoddyl/core/fwd.hpp>
+#include <crocoddyl/core/constraints/constraint-manager.hpp>
+
 #include <crocoddyl/core/utils/exception.hpp>
 #include <crocoddyl/core/utils/callbacks.hpp>
 #include <crocoddyl/core/action-base.hpp>
+#include <crocoddyl/core/constraints/residual.hpp>
 #include <crocoddyl/core/residuals/control.hpp>
 #include <crocoddyl/core/activations/quadratic.hpp>
 #include <crocoddyl/core/activations/weighted-quadratic.hpp>
@@ -28,12 +31,14 @@
 #include <crocoddyl/multibody/residuals/frame-velocity.hpp>
 #include <crocoddyl/multibody/residuals/control-gravity.hpp>
 
+
+
 #include "panda_torque_mpc/crocoddyl_reaching.h"
 
 namespace panda_torque_mpc
 {
-
-    CrocoddylReaching::CrocoddylReaching(pin::Model _model_pin, CrocoddylConfig _config) :
+    CrocoddylReaching::CrocoddylReaching(pin::Model _model_pin, const boost::shared_ptr<pin::GeometryModel>& _collision_model ,
+        CrocoddylConfig _config) :
     config_(_config)
     {
 
@@ -60,6 +65,33 @@ namespace panda_torque_mpc
         cost_velocity_name_ = "velocity_cost";
         cost_state_reg_name_ = "state_reg";
         cost_ctrl_reg_name_ = "ctrl_reg";
+
+        // Collision constraints
+        auto runningConstraintModelManager =  boost::make_shared<crocoddyl::ConstraintModelManager>(state);
+        auto terminalConstraintModelManager =  boost::make_shared<crocoddyl::ConstraintModelManager>(state);
+        Eigen::VectorXd lower_bound(1);
+        Eigen::VectorXd upper_bound(1);
+
+        lower_bound << 1e-1;
+        upper_bound << std::numeric_limits<double>::infinity();
+
+        for (int col_idx = 0; col_idx < _collision_model->collisionPairs.size(); col_idx++)
+        {
+
+            auto obstacle_distance_residual = boost::make_shared<colmpc::ResidualDistanceCollision>
+                (colmpc::ResidualDistanceCollision(state, 7, _collision_model, col_idx));
+            auto constraint = boost::make_shared<crocoddyl::ConstraintModelResidual>(
+                state,
+                obstacle_distance_residual,
+                lower_bound,
+                upper_bound
+            );
+            std::string running_constraint_name = "col" + std::to_string(col_idx);
+            std::string terminal_constraint_name = "col_term" + std::to_string(col_idx);
+            runningConstraintModelManager->addConstraint(running_constraint_name, constraint);
+            terminalConstraintModelManager->addConstraint(terminal_constraint_name, constraint);
+
+        }
 
         // Frame translation
         auto frame_translation_cost = boost::make_shared<crocoddyl::CostModelResidual>(
@@ -101,8 +133,9 @@ namespace panda_torque_mpc
             runningCostModel.get()->addCost(cost_translation_name_, frame_translation_cost, _config.w_frame_running); // TODO: weight schedule
             runningCostModel.get()->addCost(cost_placement_name_,   frame_placement_cost, _config.w_frame_running); // TODO: weight schedule
             runningCostModel.get()->addCost(cost_velocity_name_,    frame_velocity_cost, _config.w_frame_vel_running); // TODO: weight schedule
-
-            auto running_DAM = boost::make_shared<crocoddyl::DifferentialActionModelFreeFwdDynamics>(state, actuation, runningCostModel);
+            
+            auto running_DAM = boost::make_shared<crocoddyl::DifferentialActionModelFreeFwdDynamics>(state, actuation, runningCostModel, runningConstraintModelManager);
+            // auto running_DAM = boost::make_shared<crocoddyl::DifferentialActionModelFreeFwdDynamics>(state, actuation, runningCostModel);
             running_DAM->set_armature(_config.armature);
 
             // Deactivate goal cost by default until a proper reference is set
@@ -126,8 +159,8 @@ namespace panda_torque_mpc
         terminalCostModel.get()->addCost(cost_placement_name_,   frame_placement_cost,   _config.w_frame_terminal*_config.dt_ocp);
         terminalCostModel.get()->addCost(cost_velocity_name_,    frame_velocity_cost,    _config.w_frame_vel_terminal*_config.dt_ocp);
 
-
-        auto terminal_DAM = boost::make_shared<crocoddyl::DifferentialActionModelFreeFwdDynamics>(state, actuation, terminalCostModel);
+        auto terminal_DAM = boost::make_shared<crocoddyl::DifferentialActionModelFreeFwdDynamics>(state, actuation, terminalCostModel, terminalConstraintModelManager);
+        // auto terminal_DAM = boost::make_shared<crocoddyl::DifferentialActionModelFreeFwdDynamics>(state, actuation, terminalCostModel);
         terminal_DAM->set_armature(_config.armature);
 
         // Deactivate goal cost by default until a proper reference is set
@@ -139,11 +172,24 @@ namespace panda_torque_mpc
 
         // Shooting problem
         auto shooting_problem = boost::make_shared<crocoddyl::ShootingProblem>(x0_dummy, running_IAMs, terminal_IAM);
-        ocp_ = boost::make_shared<crocoddyl::SolverFDDP>(shooting_problem);
-
-        // Callbacks
+        ocp_ = boost::make_shared<mim_solvers::SolverCSQP>(shooting_problem);
+        // ocp_ = boost::make_shared<mim_solvers::SolverSQP>(shooting_problem);
+        // ocp_ = boost::make_shared<crocoddyl::SolverFDDP>(shooting_problem);
+        ocp_->set_termination_tolerance(_config.solver_termination_tolerance);
+        ocp_->set_max_qp_iters(_config.max_qp_iter);
+        ocp_->set_eps_abs(_config.qp_termination_tol_abs);
+        ocp_->set_eps_rel(_config.qp_termination_tol_rel);
+        ocp_->setCallbacks(false);
+        
+        // Callbacks from crocoddyl
         std::vector<boost::shared_ptr<crocoddyl::CallbackAbstract>> callbacks;
         callbacks.push_back(boost::make_shared<crocoddyl::CallbackVerbose>());
+
+
+        // Callbacks from Mim Solvers
+        std::cout << "costs term:   " << *terminalCostModel << std::endl;
+        std::cout << "constraint term:   " << *terminalConstraintModelManager << std::endl;
+        std::cout << "shooting pronlem:   " << *shooting_problem<< std::endl;
 
         std::cout << "ddp problem set up " << std::endl;
     }
